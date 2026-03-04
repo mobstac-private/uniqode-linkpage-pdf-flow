@@ -2,17 +2,45 @@
 """
 Linkpages as PDF Collection — End-to-End API Flow
 ==================================================
-Converts the Postman collection "POC: Linkpages as PDF collection" into a
-sequential Python script where each step feeds its output into the next.
+Automates the Uniqode Linkpage + PDF workflow with customizable steps.
 
 Dependencies: pip install requests
 Usage:
+    # Full flow: create linkpage + QR + upload PDF + attach
     python linkpage_pdf_flow.py \
-        --token "YOUR_API_KEY" \
-        --org-id 949 \
-        --pdf-path /path/to/sample.pdf \
-        --linkpage-name "Hersheys TLC 101" \
-        --qr-name "QR: Hersheys 10001"
+        --token "YOUR_API_KEY" --org-id 949 \
+        --pdf-path /path/to/sample.pdf
+
+    # Use existing linkpage + direct PDF URL (skip upload)
+    python linkpage_pdf_flow.py \
+        --token "YOUR_API_KEY" --org-id 949 \
+        --linkpage-id 56055 --skip-qr \
+        --pdf-url "https://eddy.pro/pdf/443643"
+
+    # Add multiple PDFs at once
+    python linkpage_pdf_flow.py \
+        --token "YOUR_API_KEY" --org-id 949 \
+        --pdf-path file1.pdf file2.pdf file3.pdf
+
+    # Replace all existing PDF links
+    python linkpage_pdf_flow.py \
+        --token "YOUR_API_KEY" --org-id 949 \
+        --linkpage-id 56055 --skip-qr \
+        --pdf-url "https://eddy.pro/pdf/443643" \
+        --action replace
+
+    # Replace a specific link (delete + add in one step)
+    python linkpage_pdf_flow.py \
+        --token "YOUR_API_KEY" --org-id 949 \
+        --linkpage-id 56055 --skip-qr \
+        --action replace-link --link-ids 265965 \
+        --pdf-url "https://eddy.pro/pdf/NEW_ID"
+
+    # Delete specific links from a linkpage
+    python linkpage_pdf_flow.py \
+        --token "YOUR_API_KEY" --org-id 949 \
+        --linkpage-id 56055 --skip-qr \
+        --action delete --link-ids 265965 265966
 
 You can also set env vars instead of CLI args:
     UNIQODE_TOKEN, UNIQODE_ORG_ID, UNIQODE_ENV (qa|prod)
@@ -23,7 +51,6 @@ import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -104,6 +131,26 @@ def create_linkpage(token: str, org_id: int, name: str) -> dict:
     data = resp.json()
     log.info("  Linkpage ID  : %s", data.get("id"))
     log.info("  Linkpage URL : %s", data.get("url"))
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (alt) — Get existing Linkpage
+# ---------------------------------------------------------------------------
+def get_linkpage(token: str, org_id: int, linkpage_id: int) -> dict:
+    """
+    GET /api/2.0/linkpage/{linkpage_id}/?organization={org_id}
+    Fetches an existing linkpage by ID.
+    """
+    log.info("━" * 60)
+    log.info("STEP 1 — Get existing Linkpage: %s", linkpage_id)
+    url = f"{BASE_URL}/linkpage/{linkpage_id}/?organization={org_id}"
+    resp = requests.get(url, headers=auth_headers(token))
+    check_response(resp, "1-get-linkpage")
+    data = resp.json()
+    log.info("  Linkpage ID  : %s", data.get("id"))
+    log.info("  Linkpage URL : %s", data.get("url"))
+    log.info("  Existing links: %s", len(data.get("links", [])))
     return data
 
 
@@ -379,58 +426,7 @@ def activate_media(
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Add PDF link to the Linkpage
-# ---------------------------------------------------------------------------
-def add_pdf_to_linkpage(
-    token: str,
-    org_id: int,
-    linkpage_id: int,
-    linkpage_url: str,
-    pdf_url: str,
-    pdf_name: str,
-) -> dict:
-    """
-    PUT /api/2.0/linkpage/{linkpage_id}/?organization={org_id}
-    Adds a link entry of url_type=10 (PDF) to the linkpage.
-    """
-    log.info("━" * 60)
-    log.info("STEP 5 — Add PDF to Linkpage %s", linkpage_id)
-    url = f"{BASE_URL}/linkpage/{linkpage_id}/?organization={org_id}"
-    payload = {
-        "links": [
-            {
-                "url_type": 10,
-                "deleted": False,
-                "url": "",
-                "title": pdf_name,
-                "image_type": 1,
-                "image_url": "",
-                "field_data": {
-                    "pdf_url": pdf_url,
-                    "pdf_name": pdf_name,
-                },
-            }
-        ],
-        "url": linkpage_url,
-        "organization": org_id,
-    }
-    resp = requests.put(url, headers=auth_headers(token), json=payload)
-    check_response(resp, "5-add-pdf-to-linkpage")
-
-    # PUT response may not include links — re-fetch to verify
-    get_resp = requests.get(url, headers=auth_headers(token))
-    data = get_resp.json() if get_resp.ok else resp.json()
-    links = data.get("links", [])
-    log.info("  Links count : %s", len(links))
-    for lnk in links:
-        log.info("    Link ID=%s  type=%s  pdf_url=%s",
-                 lnk.get("id"), lnk.get("url_type"),
-                 lnk.get("field_data", {}).get("pdf_url", "N/A"))
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Step 6 — Delete PDF from Linkpage (optional)
+# Step 6 — Delete PDF from Linkpage
 # ---------------------------------------------------------------------------
 def delete_pdf_from_linkpage(
     token: str,
@@ -460,96 +456,213 @@ def delete_pdf_from_linkpage(
 
 
 # ---------------------------------------------------------------------------
+# Upload helper — handles a single PDF file upload (Steps 3→4.2)
+# ---------------------------------------------------------------------------
+def upload_single_pdf(
+    token: str, org_id: int, pdf_path: str, media_folder: int = None
+) -> tuple[str, str]:
+    """
+    Runs Steps 3, 4, 4.1, 4.2 for a single PDF file.
+    Returns (pdf_url, pdf_name).
+    """
+    signed_url_data = get_signed_url(
+        token, org_id, content_type="application", folder=media_folder
+    )
+    media_id = signed_url_data.get("id")
+    pdf_url = f"{PDF_BASE_URL}/pdf/{media_id}"
+    log.info("  Resolved PDF URL : %s", pdf_url)
+
+    upload_media_to_s3(signed_url_data, pdf_path)
+
+    media_details = verify_media(token, org_id, media_id)
+
+    pdf_name = os.path.basename(pdf_path)
+    activate_media(token, org_id, media_id, media_details, pdf_name)
+
+    return pdf_url, pdf_name
+
+
+# ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
 def run_flow(
     token: str,
     org_id: int,
-    pdf_path: str,
+    pdf_paths: list[str] = None,
+    pdf_urls: list[str] = None,
+    pdf_names: list[str] = None,
+    linkpage_id: int = None,
     linkpage_name: str = "Hersheys TLC 101",
     qr_name: str = "QR: Hersheys 10001",
+    skip_qr: bool = False,
     media_folder: int = None,
-    skip_delete: bool = True,
+    action: str = "add",
+    link_ids_to_delete: list[int] = None,
     output_dir: str = ".",
 ):
-    """Execute the full flow, chaining outputs from each step."""
-    results = {}
+    """Execute the flow with customizable steps.
 
-    # ── Step 1 ──
-    linkpage = create_linkpage(token, org_id, linkpage_name)
+    Modes:
+      action="add"          — Add PDF link(s) to the linkpage (default).
+      action="replace"      — Remove all existing links, then add new ones.
+      action="replace-link" — Remove specific link(s) by --link-ids, then add new ones.
+      action="delete"       — Delete specific links (by --link-ids) from the linkpage.
+
+    Skippable steps:
+      --linkpage-id    → Skip linkpage creation (Step 1), use existing.
+      --skip-qr        → Skip QR code steps (Steps 2, 2.1, 2.2).
+      --pdf-url        → Skip upload steps (Steps 3, 4, 4.1, 4.2), use URL directly.
+    """
+    results = {}
+    pdf_paths = pdf_paths or []
+    pdf_urls = pdf_urls or []
+    pdf_names = pdf_names or []
+
+    # ── Step 1: Linkpage ──
+    if linkpage_id:
+        linkpage = get_linkpage(token, org_id, linkpage_id)
+    else:
+        linkpage = create_linkpage(token, org_id, linkpage_name)
     linkpage_id = linkpage["id"]
     linkpage_url = linkpage["url"]
     results["linkpage"] = linkpage
 
-    # ── Step 2 ──
-    qr = create_qr_code(token, org_id, linkpage_id, qr_name)
-    qr_code_id = qr["id"]
-    results["qr_code"] = qr
+    # ── Steps 2, 2.1, 2.2: QR Code (optional) ──
+    if skip_qr:
+        log.info("━" * 60)
+        log.info("SKIPPING QR Code steps (--skip-qr)")
+    else:
+        qr = create_qr_code(token, org_id, linkpage_id, qr_name)
+        qr_code_id = qr["id"]
+        results["qr_code"] = qr
 
-    # ── Step 2.1 ──
-    qr_details = get_qr_details(token, qr_code_id)
-    results["qr_details"] = qr_details
+        qr_details = get_qr_details(token, qr_code_id)
+        results["qr_details"] = qr_details
 
-    # ── Step 2.2 ──
-    qr_image_path = download_qr_image(token, qr_code_id, output_dir=output_dir)
-    results["qr_image_path"] = qr_image_path
+        qr_image_path = download_qr_image(token, qr_code_id, output_dir=output_dir)
+        results["qr_image_path"] = qr_image_path
 
-    # ── Step 3 ──
-    signed_url_data = get_signed_url(
-        token, org_id, content_type="application", folder=media_folder
-    )
-    results["signed_url"] = signed_url_data
+    # ── Delete action: just remove links and exit ──
+    if action == "delete":
+        if not link_ids_to_delete:
+            log.error("--action delete requires --link-ids")
+            sys.exit(1)
+        delete_result = delete_pdf_from_linkpage(
+            token, org_id, linkpage_id, linkpage_url, link_ids_to_delete
+        )
+        results["delete_result"] = delete_result
+        _print_summary(results, linkpage_id, linkpage_url)
+        return results
 
-    # Derive the pdf_url that the platform will serve after upload.
-    # Pattern: {PDF_BASE_URL}/pdf/{media_id}
-    # QA: https://q.eddy.pro/pdf/{id}  |  Production: https://eddy.pro/pdf/{id}
-    media_id = signed_url_data.get("id")
-    pdf_url = f"{PDF_BASE_URL}/pdf/{media_id}"
-    log.info("  Resolved PDF URL : %s", pdf_url)
+    # ── Resolve PDF URLs: upload files + collect direct URLs ──
+    # Each entry is (pdf_url, pdf_name)
+    resolved_pdfs: list[tuple[str, str]] = []
 
-    # ── Step 4 ──
-    upload_resp = upload_media_to_s3(signed_url_data, pdf_path)
-    results["upload_status"] = upload_resp.status_code
+    # Upload local PDF files (Steps 3→4.2 for each)
+    for i, pdf_path in enumerate(pdf_paths):
+        log.info("━" * 60)
+        log.info("UPLOADING PDF %d/%d: %s", i + 1, len(pdf_paths), pdf_path)
+        pdf_url, pdf_name = upload_single_pdf(
+            token, org_id, pdf_path, media_folder=media_folder
+        )
+        resolved_pdfs.append((pdf_url, pdf_name))
 
-    # ── Step 4.1 ──
-    media_details = verify_media(token, org_id, media_id)
-    results["media_details"] = media_details
+    # Direct PDF URLs (skip upload)
+    for i, url in enumerate(pdf_urls):
+        name = pdf_names[i] if i < len(pdf_names) else f"PDF {i + 1}"
+        log.info("━" * 60)
+        log.info("USING DIRECT PDF URL %d/%d: %s", i + 1, len(pdf_urls), url)
+        resolved_pdfs.append((url, name))
 
-    # ── Step 4.2 ──
-    pdf_name = os.path.basename(pdf_path)
-    activated_media = activate_media(
-        token, org_id, media_id, media_details, pdf_name
-    )
-    results["activated_media"] = activated_media
+    if not resolved_pdfs:
+        log.warning("No PDFs to attach — finishing without link changes")
+        _print_summary(results, linkpage_id, linkpage_url)
+        return results
 
-    # ── Step 5 ──
-    updated_linkpage = add_pdf_to_linkpage(
-        token, org_id, linkpage_id, linkpage_url, pdf_url, pdf_name
-    )
-    results["updated_linkpage"] = updated_linkpage
-
-    # ── Step 6 (optional) ──
-    if not skip_delete:
-        link_ids = [lnk["id"] for lnk in updated_linkpage.get("links", []) if "id" in lnk]
-        if link_ids:
-            delete_result = delete_pdf_from_linkpage(
-                token, org_id, linkpage_id, linkpage_url, link_ids
+    # ── Replace action: delete existing links first ──
+    if action == "replace":
+        existing_links = linkpage.get("links", [])
+        existing_ids = [lnk["id"] for lnk in existing_links if "id" in lnk]
+        if existing_ids:
+            log.info("━" * 60)
+            log.info("REPLACE MODE — Removing %d existing link(s)", len(existing_ids))
+            delete_pdf_from_linkpage(
+                token, org_id, linkpage_id, linkpage_url, existing_ids
             )
-            results["delete_result"] = delete_result
         else:
-            log.warning("  No link IDs found to delete — skipping Step 6")
+            log.info("REPLACE MODE — No existing links to remove")
+
+    # ── Replace-link action: delete only the specified link(s), then add new ones ──
+    if action == "replace-link":
+        if not link_ids_to_delete:
+            log.error("--action replace-link requires --link-ids")
+            sys.exit(1)
+        log.info("━" * 60)
+        log.info("REPLACE-LINK MODE — Removing link(s) %s, then adding new", link_ids_to_delete)
+        delete_pdf_from_linkpage(
+            token, org_id, linkpage_id, linkpage_url, link_ids_to_delete
+        )
+
+    # ── Step 5: Add PDF link(s) to the Linkpage ──
+    # Build the links payload with all resolved PDFs
+    links_payload = []
+    for pdf_url, pdf_name in resolved_pdfs:
+        links_payload.append({
+            "url_type": 10,
+            "deleted": False,
+            "url": "",
+            "title": pdf_name,
+            "image_type": 1,
+            "image_url": "",
+            "field_data": {
+                "pdf_url": pdf_url,
+                "pdf_name": pdf_name,
+            },
+        })
+
+    log.info("━" * 60)
+    log.info("STEP 5 — Add %d PDF link(s) to Linkpage %s", len(links_payload), linkpage_id)
+    url = f"{BASE_URL}/linkpage/{linkpage_id}/?organization={org_id}"
+    payload = {
+        "links": links_payload,
+        "url": linkpage_url,
+        "organization": org_id,
+    }
+    resp = requests.put(url, headers=auth_headers(token), json=payload)
+    check_response(resp, "5-add-pdf-to-linkpage")
+
+    # PUT response may not include links — re-fetch to verify
+    get_resp = requests.get(url, headers=auth_headers(token))
+    data = get_resp.json() if get_resp.ok else resp.json()
+    links = data.get("links", [])
+    log.info("  Links count : %s", len(links))
+    for lnk in links:
+        log.info("    Link ID=%s  type=%s  pdf_url=%s",
+                 lnk.get("id"), lnk.get("url_type"),
+                 lnk.get("field_data", {}).get("pdf_url", "N/A"))
+    results["updated_linkpage"] = data
 
     # ── Summary ──
+    _print_summary(results, linkpage_id, linkpage_url)
+    return results
+
+
+def _print_summary(results: dict, linkpage_id: int, linkpage_url: str):
+    """Print the final flow summary."""
     log.info("━" * 60)
     log.info("✅  FLOW COMPLETE")
     log.info("  Linkpage ID   : %s", linkpage_id)
     log.info("  Linkpage URL  : %s", linkpage_url)
-    log.info("  QR Code ID    : %s", qr_code_id)
-    log.info("  QR Image      : %s", qr_image_path)
-    log.info("  PDF URL       : %s", pdf_url)
+    if "qr_code" in results:
+        log.info("  QR Code ID    : %s", results["qr_code"].get("id"))
+    if "qr_image_path" in results:
+        log.info("  QR Image      : %s", results["qr_image_path"])
+    if "updated_linkpage" in results:
+        links = results["updated_linkpage"].get("links", [])
+        for lnk in links:
+            pdf_url = lnk.get("field_data", {}).get("pdf_url", "N/A")
+            log.info("  PDF URL       : %s", pdf_url)
     log.info("━" * 60)
-
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +670,36 @@ def run_flow(
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Run the Linkpages-as-PDF API flow end-to-end."
+        description="Run the Linkpages-as-PDF API flow end-to-end.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full flow (create linkpage + QR + upload + attach)
+  %(prog)s --token TOKEN --org-id 949 --pdf-path sample.pdf
+
+  # Use existing linkpage, skip QR, provide PDF URL directly
+  %(prog)s --token TOKEN --org-id 949 --linkpage-id 56055 --skip-qr \\
+           --pdf-url "https://eddy.pro/pdf/443643"
+
+  # Upload multiple PDFs to a new linkpage
+  %(prog)s --token TOKEN --org-id 949 --pdf-path a.pdf b.pdf c.pdf
+
+  # Replace all links on an existing linkpage
+  %(prog)s --token TOKEN --org-id 949 --linkpage-id 56055 --skip-qr \\
+           --pdf-url "https://eddy.pro/pdf/1" --action replace
+
+  # Replace a specific link (delete old + add new in one step)
+  %(prog)s --token TOKEN --org-id 949 --linkpage-id 56055 --skip-qr \\
+           --action replace-link --link-ids 265965 \\
+           --pdf-url "https://eddy.pro/pdf/NEW_ID"
+
+  # Delete specific links
+  %(prog)s --token TOKEN --org-id 949 --linkpage-id 56055 --skip-qr \\
+           --action delete --link-ids 265965 265966
+""",
     )
+
+    # ── Required / auth ──
     parser.add_argument(
         "--token",
         default=os.getenv("UNIQODE_TOKEN"),
@@ -577,31 +718,73 @@ def main():
         help="Target environment (or set UNIQODE_ENV env var). "
              "qa = QA/staging, prod = production",
     )
+
+    # ── PDF sources (at least one required for add/replace) ──
     parser.add_argument(
         "--pdf-path",
-        required=True,
-        help="Path to the PDF file to upload",
+        nargs="+",
+        default=[],
+        help="Path(s) to PDF file(s) to upload. Accepts multiple files.",
+    )
+    parser.add_argument(
+        "--pdf-url",
+        nargs="+",
+        default=[],
+        help="Direct PDF URL(s) — skip upload. Accepts multiple URLs.",
+    )
+    parser.add_argument(
+        "--pdf-name",
+        nargs="+",
+        default=[],
+        help="Display name(s) for --pdf-url entries (in same order).",
+    )
+
+    # ── Linkpage options ──
+    parser.add_argument(
+        "--linkpage-id",
+        type=int,
+        default=None,
+        help="Use an existing linkpage instead of creating a new one.",
     )
     parser.add_argument(
         "--linkpage-name",
         default="Hersheys TLC 101",
-        help="Name for the new linkpage",
+        help="Name for a new linkpage (ignored if --linkpage-id is set)",
     )
+
+    # ── QR options ──
     parser.add_argument(
         "--qr-name",
         default="QR: Hersheys 10001",
         help="Name for the new QR code",
     )
     parser.add_argument(
+        "--skip-qr",
+        action="store_true",
+        help="Skip QR code creation (Steps 2, 2.1, 2.2)",
+    )
+
+    # ── Action ──
+    parser.add_argument(
+        "--action",
+        choices=["add", "replace", "replace-link", "delete"],
+        default="add",
+        help="Link operation: add (default), replace all, replace-link (swap one), or delete",
+    )
+    parser.add_argument(
+        "--link-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Link ID(s) to delete (for --action delete) or swap (for --action replace-link)",
+    )
+
+    # ── Misc ──
+    parser.add_argument(
         "--media-folder",
         type=int,
         default=None,
         help="Optional media folder ID for the S3 upload",
-    )
-    parser.add_argument(
-        "--delete-after",
-        action="store_true",
-        help="Also run Step 6 (delete PDF from linkpage) after adding",
     )
     parser.add_argument(
         "--output-dir",
@@ -632,17 +815,36 @@ def main():
         parser.error("--token is required (or set UNIQODE_TOKEN env var)")
     if not args.org_id:
         parser.error("--org-id is required (or set UNIQODE_ORG_ID env var)")
-    if not Path(args.pdf_path).is_file():
-        parser.error(f"PDF file not found: {args.pdf_path}")
+
+    # Validate PDF sources based on action
+    if args.action in ("add", "replace", "replace-link"):
+        if not args.pdf_path and not args.pdf_url:
+            parser.error(
+                f"--action {args.action} requires at least one --pdf-path or --pdf-url"
+            )
+    if args.action == "delete" and not args.link_ids:
+        parser.error("--action delete requires --link-ids")
+    if args.action == "replace-link" and not args.link_ids:
+        parser.error("--action replace-link requires --link-ids to specify which link(s) to replace")
+
+    # Validate PDF file paths exist
+    for p in args.pdf_path:
+        if not Path(p).is_file():
+            parser.error(f"PDF file not found: {p}")
 
     results = run_flow(
         token=args.token,
         org_id=args.org_id,
-        pdf_path=args.pdf_path,
+        pdf_paths=args.pdf_path,
+        pdf_urls=args.pdf_url,
+        pdf_names=args.pdf_name,
+        linkpage_id=args.linkpage_id,
         linkpage_name=args.linkpage_name,
         qr_name=args.qr_name,
+        skip_qr=args.skip_qr,
         media_folder=args.media_folder,
-        skip_delete=not args.delete_after,
+        action=args.action,
+        link_ids_to_delete=args.link_ids,
         output_dir=args.output_dir,
     )
 
